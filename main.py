@@ -17,6 +17,8 @@ import matplotlib.pyplot as plt
 import torch.nn.init as init
 import pandas as pd
 import pruning
+import argparse
+import copy
 
 torch.cuda.is_available()
 
@@ -125,7 +127,10 @@ def train(mynn, train_x, train_y, test_x, test_y, tr_vec, te_vec):
     
     return tr_acc, te_acc, tr_loss, te_loss
 
-def plot_results(tr_acc, te_acc, tr_loss, te_loss):
+def plot_results(tr_acc, te_acc, tr_loss, te_loss, imp_num, wei_prune_percent):
+    """
+    Plot the results of the experiment
+    """
     fig, axs = plt.subplots(1, 2, figsize=(12, 3))
     axs[0].plot(tr_acc, linestyle='-', label='train')
     axs[0].plot(te_acc, linestyle='-', label='test')
@@ -137,27 +142,192 @@ def plot_results(tr_acc, te_acc, tr_loss, te_loss):
     axs[1].set_xlabel('epochs')
     axs[1].legend()
     plt.tight_layout()
-    plt.savefig('loss.png')
-    plt.show()
+    if imp_num == 0:
+        plt.savefig('grokking_without_pruning.png')
+        print("Save figure to grokking_without_pruning.png")
+    else:
+        wei_prune_percent = int(wei_prune_percent * 100)
+        plt.savefig(f'grokking_with_pruning_{wei_prune_percent}%.png')
+        print(f"Save figure to grokking_with_pruning_{wei_prune_percent}%.png")
+    # plt.show()
 
-if __name__ == '__main__':
-    #### modulo addition task
-    D = 73       #mod
-    alpha = 0.8  #ratio of train data
-    H = round(D*D*alpha) #sample size
-    te_num = D*D - H
+def run_fix_mask(args, seed, rewind_weight_mask):
+    """
+    Reset the remaining weights to their original values and train the network
+    """
+    ### set seed
+    pruning.setup_seed(seed)
+    
+    ### load mod and ratio of train data
+    D = args.D
+    alpha = args.alpha
+    
+    H = round(D * D * alpha) #sample size
+    te_num = D * D - H #test size
+    width = args.width
 
     ### load data
     train_x, train_y, test_x, test_y, tr_vec, te_vec = prepare_data(D, H)
 
     ### define model
-    width = 512
     mynn = NN(D, H, width).cuda()
     pruning.add_mask(mynn)
 
-    ### training and test
-    tr_acc, te_acc, tr_loss, te_loss = train(mynn, train_x, train_y, test_x, test_y, tr_vec, te_vec)
+    if rewind_weight_mask is not None:
+        mynn.load_state_dict(rewind_weight_mask)
+    model_sparsity = pruning.print_sparsity(mynn)
+    
+    # forzen the mask
+    for name, param in mynn.named_parameters():
+        if 'mask' in name:
+            param.requires_grad = False
 
-    ### plot results
-    plot_results(tr_acc, te_acc, tr_loss, te_loss)
+    optimizer = torch.optim.SGD(mynn.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    loss_func = nn.MSELoss()
+    
+    acc = {'epoch': [], 'train_acc': [], 'test_acc': []}
+    loss_dict = {'epoch': [], 'train_loss': [], 'test_loss': []}
+
+    for t in range(args.epochs_fix_mask):
+        loss_dict['epoch'].append(t)
+        acc['epoch'].append(t)
+        optimizer.zero_grad()
+        
+        #training set
+        output = mynn(train_x)
+        acc_train = (output.argmax(dim=1) == train_y.argmax(dim=1)).float().mean().item()
+        
+        loss = loss_func(output, train_y)
+        loss_dict['train_loss'].append(loss.item())
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            output = mynn(test_x)
+            loss = loss_func(output, test_y)
+            loss_dict['test_loss'].append(loss.item())
+            acc_test = (output.argmax(dim=1) == test_y.argmax(dim=1)).float().mean().item()
+            
+        # add epoch, train acc, test acc to dict
+        acc['train_acc'].append(acc_train)
+        acc['test_acc'].append(acc_test)
+
+        print("(Fix Mask) Epoch: [{}] Train Acc: {:.2f} Test Acc: {:.2f}"
+        .format(t, acc_train*100, acc_test*100))
+    
+    return acc, loss_dict, model_sparsity
+
+def run_get_mask(args, seed, p, rewind_weight_mask):
+    """
+    Train the network for train_stop_epoch epochs, then prune the network and create a new mask
+    """
+    ### set seed
+    pruning.setup_seed(seed)
+    
+    ### load mod and ratio of train data
+    D = args.D
+    alpha = args.alpha
+    
+    H = round(D * D * alpha) #sample size
+    te_num = D * D - H #test size
+    width = args.width
+
+    ### load data
+    train_x, train_y, test_x, test_y, tr_vec, te_vec = prepare_data(D, H)
+
+    ### define model
+    mynn = NN(D, H, width).cuda()
+    pruning.add_mask(mynn)
+
+    # if rewind_weight_mask:
+    #     mynn.load_state_dict(rewind_weight_mask)
+    #     if args.init_soft_mask_type == 'all_one':
+    #         pruning.soft_mask_init(mynn, init_type=args.init_soft_mask_type, seed=seed)
+    # else:
+
+    ### add trainable noise to mask
+    pruning.soft_mask_init(mynn, init_type=args.init_soft_mask_type, seed=seed)
+
+    optimizer = torch.optim.SGD(mynn.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    loss_func = nn.MSELoss()
+    
+    acc = {'train_acc': [], 'test_acc': []}
+    loss_dict = {'train_loss': [], 'test_loss': []}
+
+    rewind_weight = copy.deepcopy(mynn.state_dict())
+
+    for t in range(args.epochs_train_mask):
+        optimizer.zero_grad()
+        output_train = mynn(train_x)
+        
+        acc_train = (output_train.argmax(dim=1) == train_y.argmax(dim=1)).float().mean().item()
+        loss_train = loss_func(output_train, train_y)
+        acc['train_acc'].append(acc_train)
+        loss_dict['train_loss'].append(loss_train.item())
+        
+        loss_train.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            output = mynn(test_x)
+            loss = loss_func(output, test_y)
+            loss_dict['test_loss'].append(loss.item())
+            acc_test = (output.argmax(dim=1) == test_y.argmax(dim=1)).float().mean().item()
+            acc['test_acc'].append(acc_test)
+
+        print("(Get Mask) Epoch: [{}] Train Acc: {:.2f} Test Acc: {:.2f}"
+        .format(t, acc_train*100, acc_test*100))
+
+    best_epoch_mask = pruning.get_final_mask_epoch(mynn, args.wei_prune_percent)
+
+    return best_epoch_mask, rewind_weight
+
+def parser_loader():
+    parser = argparse.ArgumentParser(description='Grokking ticket')
+    parser.add_argument('--D', type=int, default=73, help='mod')
+    parser.add_argument('--alpha', type=float, default=0.8, help='ratio of train data')
+    parser.add_argument('--seed', type=int, default=111, help='random seed')
+    parser.add_argument('--width', type=int, default=512, help='width of hidden layer')
+    parser.add_argument('--lr', type=float, default=10.0, help='learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.0, help='weight decay')
+    parser.add_argument('--epochs_fix_mask', type=int, default=10000, help='epochs of fix mask')
+    parser.add_argument('--epochs_train_mask', type=int, default=10000, help='epochs of train mask')
+    parser.add_argument('--wei_prune_percent', type=float, default=0.5, help='weight prune percent')
+    parser.add_argument('--init_soft_mask_type', type=str, default='all_one', help='init soft mask')
+    return parser
+
+if __name__ == '__main__':
+
+    parser = parser_loader()
+    args = parser.parse_args()
+    seed = 111
+    rewind_weight = None
+    
+    H = round(args.D * args.D * args.alpha) #sample size
+    te_num = args.D * args.D - H #test size
+
+    for p in range(2):
+        if p == 0:
+            continue
+            print("Without pruning ...")
+            acc_dict, loss_dict, model_spar = run_fix_mask(args, seed, rewind_weight)
+            
+            ### plot results
+            plot_results(acc_dict['train_acc'], acc_dict['test_acc'], loss_dict['train_loss'], loss_dict['test_loss'], p, args.wei_prune_percent)
+
+        else:
+            print(f"With pruning {100 * args.wei_prune_percent}% ...")
+            final_mask_dict, rewind_weight = run_get_mask(args, seed, p, rewind_weight)
+
+            rewind_weight['phi_mask_train'] = final_mask_dict['phi_mask']
+            rewind_weight['phi_mask_fixed'] = final_mask_dict['phi_mask']
+            rewind_weight['psi_mask_train'] = final_mask_dict['psi_mask']
+            rewind_weight['psi_mask_fixed'] = final_mask_dict['psi_mask']
+            rewind_weight['w_mask_train'] = final_mask_dict['w_mask']
+            rewind_weight['w_mask_fixed'] = final_mask_dict['w_mask']
+
+            acc_dict, loss_dict, model_spar = run_fix_mask(args, seed, rewind_weight)
+
+            ### plot results
+            plot_results(acc_dict['train_acc'], acc_dict['test_acc'], loss_dict['train_loss'], loss_dict['test_loss'], p, args.wei_prune_percent)
 
